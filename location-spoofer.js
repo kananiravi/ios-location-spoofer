@@ -14,12 +14,23 @@
     mode: "response",
     latitude: 37.3349,
     longitude: -122.00902,
-    horizontalAccuracy: 39,
-    verticalAccuracy: 1000,
-    altitude: 530,
-    unknownValue4: 3,
+    // iOS 27 fix (ported from Joy-cwz/ios-location-spoofer):
+    // By DEFAULT we now rewrite ONLY latitude/longitude and pass every other
+    // byte of Apple's response through verbatim. iOS 27 Beta 3's locationd
+    // rejects responses whose accuracy/altitude/motion fields were stamped with
+    // constants or whose root fields (NumWifiResults/NumCellResults/DeviceType)
+    // were dropped. null = preserve the original value Apple returned.
+    horizontalAccuracy: null,
+    verticalAccuracy: null,
+    altitude: null,
+    // Motion masking is OFF by default (spoofing it is what got the old script
+    // flagged). Set spoofMotion=true to re-enable overwriting fields 11/12.
+    spoofMotion: false,
     motionActivityType: 63,
     motionActivityConfidence: 467,
+    // Rewrite cell-tower response coordinates too (fields 22/24). On by default;
+    // set false to touch Wi-Fi devices only.
+    rewriteCellTowers: true,
     failOpen: true,
     debug: false,
     dumpRaw: false,
@@ -35,18 +46,11 @@
   // Stable marker that precedes the AppleWLoc protobuf inside a REAL Apple /clls/wloc
   // response. After the marker come 2 bytes (uint16 BE payload length) then the payload.
   var APPLE_WLOC_MARKER = bytesFromArray([0x00, 0x00, 0x00, 0x01, 0x00, 0x00]);
-  var ROOT_DROP_FIELDS = { 3: true, 4: true, 33: true };
+  // iOS 27 fix: previously {3,4,33} (NumWifiResults/NumCellResults/DeviceType)
+  // were stripped from the root message. iOS 27 Beta 3 appears to reject
+  // responses missing these, so we now preserve ALL root fields verbatim.
+  var ROOT_DROP_FIELDS = {};
   var CELL_RESPONSE_FIELDS = { 22: true, 24: true };
-  var LOCATION_REPLACED_FIELDS = {
-    1: true,
-    2: true,
-    3: true,
-    4: true,
-    5: true,
-    6: true,
-    11: true,
-    12: true
-  };
 
   function bytesFromArray(values) {
     return new Uint8Array(values);
@@ -414,6 +418,32 @@
     return Math.trunc(Number(value) * 100000000);
   }
 
+  // Optional integer config: null/undefined/blank/non-finite => null (preserve
+  // original bytes). Otherwise truncated to an integer.
+  function normalizeOptionalInt(value) {
+    if (value == null || value === "") {
+      return null;
+    }
+    var n = Number(value);
+    if (!Number.isFinite(n)) {
+      return null;
+    }
+    return Math.trunc(n);
+  }
+
+  // Coordinate coercion: null / undefined / blank / whitespace => NaN so it is
+  // rejected by the range check below (instead of Number("") silently => 0,
+  // which would spoof everyone to the (0,0) null island).
+  function coerceCoordinate(value) {
+    if (value == null) {
+      return NaN;
+    }
+    if (typeof value === "string" && value.trim() === "") {
+      return NaN;
+    }
+    return Number(value);
+  }
+
   function parseBoolean(value, defaultValue) {
     if (value === true || value === false) {
       return value;
@@ -447,16 +477,25 @@
 
     cfg.enabled = parseBoolean(cfg.enabled, true);
     cfg.failOpen = parseBoolean(cfg.failOpen, true);
+    cfg.spoofMotion = parseBoolean(cfg.spoofMotion, false);
+    cfg.rewriteCellTowers = parseBoolean(cfg.rewriteCellTowers, true);
     var mode = String(cfg.mode || "response").toLowerCase();
     cfg.mode = mode === "request" || mode === "prepare" || mode === "probe" || mode === "inspect" ? mode : "response";
-    cfg.latitude = Number(cfg.latitude);
-    cfg.longitude = Number(cfg.longitude);
-    cfg.horizontalAccuracy = Math.trunc(Number(cfg.horizontalAccuracy));
-    cfg.verticalAccuracy = Math.trunc(Number(cfg.verticalAccuracy));
-    cfg.altitude = Math.trunc(Number(cfg.altitude));
-    cfg.unknownValue4 = Math.trunc(Number(cfg.unknownValue4));
+    cfg.latitude = coerceCoordinate(cfg.latitude);
+    cfg.longitude = coerceCoordinate(cfg.longitude);
+    // Accuracy / altitude: null (or blank/non-finite) means "preserve Apple's
+    // original bytes". Only coerce to an integer when a real override is given.
+    cfg.horizontalAccuracy = normalizeOptionalInt(cfg.horizontalAccuracy);
+    cfg.verticalAccuracy = normalizeOptionalInt(cfg.verticalAccuracy);
+    cfg.altitude = normalizeOptionalInt(cfg.altitude);
     cfg.motionActivityType = Math.trunc(Number(cfg.motionActivityType));
     cfg.motionActivityConfidence = Math.trunc(Number(cfg.motionActivityConfidence));
+    if (!Number.isFinite(cfg.motionActivityType)) {
+      cfg.motionActivityType = DEFAULT_CONFIG.motionActivityType;
+    }
+    if (!Number.isFinite(cfg.motionActivityConfidence)) {
+      cfg.motionActivityConfidence = DEFAULT_CONFIG.motionActivityConfidence;
+    }
     cfg.dumpRaw = cfg.dumpRaw === true || String(cfg.dumpRaw).toLowerCase() === "true";
     cfg.dumpHeaders = cfg.dumpHeaders === true || String(cfg.dumpHeaders).toLowerCase() === "true";
     cfg.prepareHeaders = cfg.prepareHeaders === true || String(cfg.prepareHeaders).toLowerCase() === "true";
@@ -474,23 +513,86 @@
     return cfg;
   }
 
+  // Returns true when an optional override field is set to a real number.
+  // null / undefined / "" / non-finite => leave the original bytes untouched.
+  function hasOverride(value) {
+    if (value == null || value === "") {
+      return false;
+    }
+    return Number.isFinite(Number(value));
+  }
+
+  // iOS 27 fix (ported from Joy-cwz/ios-location-spoofer): rewrite the Location
+  // submessage IN PLACE at the wire level. Field order is preserved exactly;
+  // only the specific fields we target are replaced, everything else (unknown
+  // tags included) is copied through verbatim.
+  //
+  //   - Latitude (1) and Longitude (2): ALWAYS rewritten (injected if absent).
+  //   - horizontalAccuracy (3), altitude (5), verticalAccuracy (6): rewritten
+  //     ONLY when the config provides a finite override; otherwise preserved.
+  //   - motionActivityType (11) / motionActivityConfidence (12): rewritten only
+  //     when config.spoofMotion is true; otherwise preserved.
+  //   - unknownValue4 (4) and every other field: always preserved.
   function patchLocation(locationPayload, config) {
-    var parts = [];
     var fields = locationPayload.length ? parseFields(locationPayload) : [];
+    var parts = [];
+    var seen = {};
+
+    var overrideH = hasOverride(config.horizontalAccuracy);
+    var overrideV = hasOverride(config.verticalAccuracy);
+    var overrideAlt = hasOverride(config.altitude);
+    var spoofMotion = config.spoofMotion === true;
+
     for (var i = 0; i < fields.length; i += 1) {
-      if (!LOCATION_REPLACED_FIELDS[fields[i].fieldNumber]) {
-        parts.push(fields[i].raw);
+      var field = fields[i];
+      var n = field.fieldNumber;
+      seen[n] = true;
+      if (n === 1) {
+        parts.push(makeVarintField(1, coordToInt(config.latitude)));
+      } else if (n === 2) {
+        parts.push(makeVarintField(2, coordToInt(config.longitude)));
+      } else if (n === 3 && overrideH) {
+        parts.push(makeVarintField(3, Math.trunc(Number(config.horizontalAccuracy))));
+      } else if (n === 5 && overrideAlt) {
+        parts.push(makeVarintField(5, Math.trunc(Number(config.altitude))));
+      } else if (n === 6 && overrideV) {
+        parts.push(makeVarintField(6, Math.trunc(Number(config.verticalAccuracy))));
+      } else if (n === 11 && spoofMotion) {
+        parts.push(makeVarintField(11, Math.trunc(Number(config.motionActivityType))));
+      } else if (n === 12 && spoofMotion) {
+        parts.push(makeVarintField(12, Math.trunc(Number(config.motionActivityConfidence))));
+      } else {
+        parts.push(field.raw);
       }
     }
 
-    parts.push(makeVarintField(1, coordToInt(config.latitude)));
-    parts.push(makeVarintField(2, coordToInt(config.longitude)));
-    parts.push(makeVarintField(3, config.horizontalAccuracy));
-    parts.push(makeVarintField(4, config.unknownValue4));
-    parts.push(makeVarintField(5, config.altitude));
-    parts.push(makeVarintField(6, config.verticalAccuracy));
-    parts.push(makeVarintField(11, config.motionActivityType));
-    parts.push(makeVarintField(12, config.motionActivityConfidence));
+    // Inject lat/lon if Apple's submessage didn't carry them (request-side or
+    // sparse responses). Matches upstream's "if Location == nil {}" semantics.
+    if (!seen[1]) {
+      parts.push(makeVarintField(1, coordToInt(config.latitude)));
+    }
+    if (!seen[2]) {
+      parts.push(makeVarintField(2, coordToInt(config.longitude)));
+    }
+    // If the user EXPLICITLY set an accuracy/altitude/motion override but Apple's
+    // Location didn't include that field, inject it so the override still applies.
+    // (With default config these are all null/off, so nothing extra is added and
+    // the minimal lat/lon-only splice is preserved.)
+    if (!seen[3] && overrideH) {
+      parts.push(makeVarintField(3, Math.trunc(Number(config.horizontalAccuracy))));
+    }
+    if (!seen[5] && overrideAlt) {
+      parts.push(makeVarintField(5, Math.trunc(Number(config.altitude))));
+    }
+    if (!seen[6] && overrideV) {
+      parts.push(makeVarintField(6, Math.trunc(Number(config.verticalAccuracy))));
+    }
+    if (!seen[11] && spoofMotion) {
+      parts.push(makeVarintField(11, Math.trunc(Number(config.motionActivityType))));
+    }
+    if (!seen[12] && spoofMotion) {
+      parts.push(makeVarintField(12, Math.trunc(Number(config.motionActivityConfidence))));
+    }
     return concatBytes(parts);
   }
 
@@ -549,7 +651,7 @@
       if (field.fieldNumber === 2 && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(2, patchWifiDevice(field.valueBytes, config)));
         wifiCount += 1;
-      } else if (isCellResponseField(field.fieldNumber) && field.wireType === 2) {
+      } else if (config.rewriteCellTowers !== false && isCellResponseField(field.fieldNumber) && field.wireType === 2) {
         parts.push(makeLengthDelimitedField(field.fieldNumber, patchCellTower(field.valueBytes, config)));
         cellCount += 1;
       } else if (!ROOT_DROP_FIELDS[field.fieldNumber]) {
@@ -778,8 +880,14 @@
         extraction.suffix
       ]);
     } else {
-      // synthetic / bare – use the simple prefix format.
+      // synthetic / bare – use the simple prefix format. Preserve any trailing
+      // bytes the extractor captured after the declared payload (the synthetic
+      // shape carries a `suffix`; bare has none) so the response round-trips
+      // byte-faithfully instead of truncating.
       response = buildAppleWLocResponse(patched.payload, extraction.prefix);
+      if (extraction.suffix && extraction.suffix.length) {
+        response = concatBytes([response, extraction.suffix]);
+      }
     }
 
     return {
@@ -810,9 +918,10 @@
       "configToken",
       "horizontalAccuracy",
       "verticalAccuracy",
-      "unknownValue4",
+      "spoofMotion",
       "motionActivityType",
       "motionActivityConfidence",
+      "rewriteCellTowers",
       "failOpen",
       "dumpRaw",
       "dumpHeaders",
@@ -1160,9 +1269,10 @@
       "horizontalAccuracy",
       "verticalAccuracy",
       "altitude",
-      "unknownValue4",
+      "spoofMotion",
       "motionActivityType",
       "motionActivityConfidence",
+      "rewriteCellTowers",
       "failOpen",
       "debug",
       "dumpRaw",
@@ -1313,7 +1423,7 @@
         if (debug) {
           console.log("Location spoofer config invalid: " + err.message + " | cfg lat/lng=" + cfg.latitude + "," + cfg.longitude);
         }
-        if (!Number.isFinite(Number(cfg.latitude)) || !Number.isFinite(Number(cfg.longitude))) {
+        if (!Number.isFinite(coerceCoordinate(cfg.latitude)) || !Number.isFinite(coerceCoordinate(cfg.longitude))) {
           cfg.latitude = DEFAULT_CONFIG.latitude;
           cfg.longitude = DEFAULT_CONFIG.longitude;
         }
