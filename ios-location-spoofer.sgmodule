@@ -1,9 +1,14 @@
 #!name=iOS Location Spoofer
-#!desc=拦截 Apple 定位服务器回应的 GPS 坐标，替换成自定义位置。适用于 Shadowrocket。
+#!desc=拦截 Apple 定位服务器回应的 GPS 坐标，替换成自定义位置。适用于 Shadowrocket。iOS 27 兼容：默认仅改写经纬度，其余字段（精度/海拔/运动状态/基站计数等）原样透传。
 #!homepage=https://github.com/mekos2772/ios-location-spoofer
 
 [Script]
-iOS Location Spoofer = type=http-response,pattern=^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$,requires-body=1,binary-body-mode=1,max-size=1048576,timeout=10,script-path=https://raw.githubusercontent.com/mekos2772/ios-location-spoofer/main/location-spoofer.js,argument=mode=response&latitude=37.3349&longitude=-122.00902&horizontalAccuracy=39&verticalAccuracy=1000&altitude=530&debug=false
+# iOS 27 fix: the argument now carries ONLY latitude/longitude (plus mode/debug).
+# horizontalAccuracy / verticalAccuracy / altitude are intentionally omitted so the
+# script preserves Apple's original values byte-for-byte. Add them back explicitly
+# (e.g. &altitude=530) only if you specifically want to override them.
+# Optional flags: &spoofMotion=true (rewrite motion fields 11/12), &rewriteCellTowers=false.
+iOS Location Spoofer = type=http-response,pattern=^https?:\/\/(?:gs-loc(?:-cn)?\.apple\.com|bluedot\.is\.autonavi\.com(?:\.gds\.alibabadns\.com)?)\/clls\/wloc(?:\?.*)?$,requires-body=1,binary-body-mode=1,max-size=1048576,timeout=10,script-path=https://raw.githubusercontent.com/mekos2772/ios-location-spoofer/main/location-spoofer.js,argument=mode=response&latitude=37.3349&longitude=-122.00902&debug=false
 
 [MITM]
 hostname = %APPEND% gs-loc.apple.com, gs-loc-cn.apple.com, bluedot.is.autonavi.com, bluedot.is.autonavi.com.gds.alibabadns.com
